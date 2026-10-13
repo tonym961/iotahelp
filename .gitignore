@@ -1,0 +1,14 @@
+# segreti: valori reali di password e chiave (mai versionare)
+iotahelp.secrets.ps1
+
+# eseguibili compilati: contengono le credenziali incorporate (verificato con strings)
+# -> si distribuiscono a parte (GitHub Release o condivisione diretta), non in git
+iotatau-help.exe
+iotatau-help-offline.exe
+iotatau-help_preview.exe
+
+# artefatti di build
+iotahelp.build.ps1
+iotahelp.build.preview.ps1
+iotahelp.build.offline.ps1
+offline/
