@@ -39,7 +39,9 @@ $Def_Rust = $true
 $Def_Sup  = $true
 $Def_Vnc  = $false
 
-$AppVersion       = '1.6.0'                         # <<< versione mostrata nella GUI e nell'exe (incrementare a ogni update)
+$AppVersion       = '1.6.0'                         # <<< versione mostrata nella GUI e nell'exe.
+#                                                   #     SI INCREMENTA L'ULTIMA CIFRA: 1.6.0 -> 1.6.1 -> 1.6.2 ...
+#                                                   #     Niente salti alla cifra di mezzo.
 $PreviewMode      = $false                          # $true = build ANTEPRIMA (simula, non installa, senza admin)
 $OfflineBuild     = $false                          # $true = build con file incorporati (impostato da build -Offline)
 $DownloadDir      = 'C:\iotatec'
