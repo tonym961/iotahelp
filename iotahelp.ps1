@@ -39,7 +39,7 @@ $Def_Rust = $true
 $Def_Sup  = $true
 $Def_Vnc  = $false
 
-$AppVersion       = '1.5.0'                         # <<< versione mostrata nella GUI e nell'exe (incrementare a ogni update)
+$AppVersion       = '1.6.0'                         # <<< versione mostrata nella GUI e nell'exe (incrementare a ogni update)
 $PreviewMode      = $false                          # $true = build ANTEPRIMA (simula, non installa, senza admin)
 $OfflineBuild     = $false                          # $true = build con file incorporati (impostato da build -Offline)
 $DownloadDir      = 'C:\iotatec'
@@ -117,7 +117,19 @@ $worker = {
             $line = '"' + $file + '"'
             foreach ($a in $argList) {
                 $q = ([string]$a) -replace '%', '%%'      # % e' speciale dentro un .bat
-                if ($q.StartsWith('-') -or $q.StartsWith([char]47)) { $line += ' ' + $q } else { $line += ' "' + $q + '"' }
+                if ($q.StartsWith('-') -or $q.StartsWith([char]47)) { $line += ' ' + $q }
+                elseif (($file -like '*msiexec*') -and ($q -match '^([A-Z][A-Z0-9_]*)=(.*)$')) {
+                    # ATTENZIONE: per msiexec la forma "NOME=valore" (virgolette su TUTTO il token)
+                    # NON e' valida, e non da' nemmeno un errore: apre la finestra d'uso di Windows
+                    # Installer ANCHE con /quiet e NON ESCE MAI. Al timeout qui viene ucciso cmd.exe
+                    # e msiexec resta orfano con la finestra modale -> era la causa di "TightVNC si
+                    # blocca e non va avanti manco in timeout", e colpiva solo TightVNC perche' e'
+                    # l'unico a passare parametri NOME=valore. Verificato: token quotato per intero
+                    # -> appeso a tempo indefinito; NOME="valore" -> risposta in 0,07 s.
+                    # La forma documentata e' NOME="valore": virgolette solo sul VALORE.
+                    $line += ' ' + $Matches[1] + '="' + $Matches[2] + '"'
+                }
+                else { $line += ' "' + $q + '"' }
             }
             Set-Content -LiteralPath $bat -Value ("@echo off`r`n" + $line + ' > "' + $outF + '" 2>&1') -Encoding ASCII
             $pi = New-Object System.Diagnostics.ProcessStartInfo
@@ -158,10 +170,16 @@ $worker = {
                 Start-Sleep -Milliseconds 700
             }
         }
-        catch { Log ("SYSTEM errore: " + $_.Exception.Message); return @{ Code = -1; Out = 'SYSTEM_FAIL' } }
+        catch { Log ("SYSTEM errore: " + $_.Exception.Message); Remove-Item -LiteralPath $bat, $outF -Force -EA SilentlyContinue; return @{ Code = -1; Out = 'SYSTEM_FAIL' } }
         finally { Unregister-ScheduledTask -TaskName $tn -Confirm:$false -EA SilentlyContinue }
         $o = ''
-        try { if (Test-Path -LiteralPath $outF) { $o = (Get-Content -LiteralPath $outF -Raw -EA SilentlyContinue) } } catch {}
+        $ran = (Test-Path -LiteralPath $outF)   # il .bat redirige sempre: senza il file il task non e' partito
+        try { if ($ran) { $o = (Get-Content -LiteralPath $outF -Raw -EA SilentlyContinue) } } catch {}
+        # il .bat e il suo output contengono la riga di comando (quindi anche le password): via dal disco
+        Remove-Item -LiteralPath $bat, $outF -Force -EA SilentlyContinue
+        # distinguere "comando eseguito senza output" da "task mai eseguito" evita di confondere un
+        # guasto dello scheduler con un risultato negativo (es. "password assente")
+        if (-not $ran) { Log 'SYSTEM: il task non ha prodotto alcun output (non eseguito?)'; return @{ Code = -1; Out = 'SYSTEM_FAIL' } }
         return @{ Code = 0; Out = ("" + $o).Trim() }
     }
     function Get-File([string]$url, [string]$dest) {
@@ -462,72 +480,298 @@ $worker = {
     }
 
     # ---------- TightVNC ----------
+    # Qui l'ordine delle operazioni e' rovesciato rispetto a quello che sembrerebbe naturale, e il
+    # motivo sta tutto nell'MSI di TightVNC (verificato leggendone le tabelle):
+    #  - le proprieta' SET_PASSWORD / VALUE_OF_PASSWORD valgono SOLO a installazione NUOVA: la custom
+    #    action che scrive la password (SetPasswordsActionSilently) ha condizione "NOT (!Server=3)",
+    #    quindi su una macchina dove TightVNC c'e' gia' l'MSI installa o ripara ma NON tocca la password;
+    #  - reinstallare la STESSA versione sopra se stessa ABORTA: custom action AlreadyUpdated (tipo 19,
+    #    errore fatale) con condizione SELFFOUND -> "TightVNC has already been updated";
+    #  - "msiexec /x <percorso.msi>" disinstalla solo se il ProductCode di QUEL file e' quello
+    #    installato: con una versione diversa restituisce 1605 e non rimuove niente.
+    # Percio': prima si prova a scrivere la password nel registro COME SYSTEM (e' esattamente cio' che
+    # fa l'MSI, con una custom action deferred/NoImpersonate: l'admin elevato da solo non basta), e
+    # solo se non funziona si passa a disinstalla-per-ProductCode + reinstalla. In ogni caso la
+    # password viene RILETTA e CONFRONTATA: non si dichiara mai "OK" senza averla verificata.
     function Install-TightVNC {
-        $pw = $cfg.vncPassword; if ($pw.Length -gt 8) { $pw = $pw.Substring(0, 8) }
+        $pw = [string]$cfg.vncPassword
+        if ([string]::IsNullOrEmpty($pw.Trim())) { throw "TightVNC: password non configurata nella build." }
+        if ($pw.Length -gt 8) { $pw = $pw.Substring(0, 8) }     # lo standard VNC cifra con DES a 8 byte
+        $regKey = 'HKLM\SOFTWARE\TightVNC\Server'
+        $regSub = 'SOFTWARE\TightVNC\Server'
+        $msiLog = Join-Path $dir 'iotahelp_vnc_msi.log'
+        $okCodes = @(0, 1641, 3010)                             # 3010/1641 = riuscito, richiede riavvio
+        $wantHex = ''
+        try { $wantHex = ((Get-VncBlob $pw | ForEach-Object { $_.ToString('x2') }) -join '') }
+        catch { throw ("TightVNC: non riesco a cifrare la password (DES non disponibile, criteri FIPS?). " + $_.Exception.Message) }
 
-        # Se TightVNC c'e' gia' E la password memorizzata coincide con la nostra, non tocco nulla:
-        # evita il disinstalla/reinstalla (che farebbe cadere una sessione VNC in corso e perderebbe
-        # le altre impostazioni). Il confronto si fa sul blob cifrato, letto come SYSTEM.
-        if ($null -ne (Get-Service -Name 'tvnserver' -EA SilentlyContinue)) {
+        # Lettura/scrittura della chiave di TightVNC. L'MSI le applica un'ACL che da' pieno controllo a
+        # SYSTEM e ad Administrators (tabella LockPermissions), quindi da processo ELEVATO di norma si
+        # legge e si scrive direttamente, senza task pianificato. Ma un'ACL sbagliata scritta
+        # dall'installer e' un caso noto, percio' se la via diretta viene negata si ripassa da SYSTEM.
+        # Vista di registro forzata a 64 bit: cosi' funziona anche se l'exe girasse a 32 bit (WOW64).
+        function VncRegBase {
+            return [Microsoft.Win32.RegistryKey]::OpenBaseKey([Microsoft.Win32.RegistryHive]::LocalMachine, [Microsoft.Win32.RegistryView]::Registry64)
+        }
+        function VncPwRead {
             try {
-                $want = ((Get-VncBlob $pw | ForEach-Object { $_.ToString('x2') }) -join '')
-                $q = SysCmd 'reg query "HKLM\SOFTWARE\TightVNC\Server" /v Password' 60
-                $have = ''
-                if ($q.Out -match 'REG_BINARY\s+([0-9A-Fa-f]+)') { $have = $Matches[1].ToLower() }
-                Log ("TightVNC password memorizzata=[" + $have + "] attesa=[" + $want + "]")
-                if ($have -and $have -eq $want) {
-                    St 'TightVNC: gia'' configurato correttamente'
-                    Log 'TightVNC: nessuna modifica necessaria, salto installazione'
-                    return
+                $base = VncRegBase
+                $s = $base.OpenSubKey($regSub, $false)
+                if ($s) {
+                    $v = $s.GetValue('Password', $null)
+                    $s.Close(); $base.Close()
+                    if ($v -is [byte[]]) { return (($v | ForEach-Object { $_.ToString('x2') }) -join '') }
+                    return ''
+                }
+                $base.Close()
+                return ''
+            }
+            catch { Log ("TightVNC: lettura diretta del registro negata (" + $_.Exception.Message + "), passo da SYSTEM") }
+            $q = SysCmd ('reg query "' + $regKey + '" /v Password') 90
+            if ($q.Out -match 'REG_BINARY\s+([0-9A-Fa-f]+)') { return $Matches[1].ToLower() }
+            return ''
+        }
+        function VncPwWrite {
+            try {
+                $base = VncRegBase
+                $s = $base.CreateSubKey($regSub)
+                $s.SetValue('Password', (Get-VncBlob $pw), [Microsoft.Win32.RegistryValueKind]::Binary)
+                $s.SetValue('UseVncAuthentication', 1, [Microsoft.Win32.RegistryValueKind]::DWord)
+                $s.SetValue('AcceptRfbConnections', 1, [Microsoft.Win32.RegistryValueKind]::DWord)
+                $s.Close(); $base.Close()
+                Log 'TightVNC: password scritta nel registro dal processo elevato.'
+                return
+            }
+            catch { Log ("TightVNC: scrittura diretta negata (" + $_.Exception.Message + "), passo da SYSTEM") }
+            # ripiego come SYSTEM: i tre valori in un solo comando raggruppato, perche' SysCmd appende
+            # la redirezione in coda e "a & b > file" catturerebbe solo l'output di b
+            $c = '( reg add "' + $regKey + '" /v Password /t REG_BINARY /d ' + $wantHex + ' /f'
+            $c += ' & reg add "' + $regKey + '" /v UseVncAuthentication /t REG_DWORD /d 1 /f'
+            $c += ' & reg add "' + $regKey + '" /v AcceptRfbConnections /t REG_DWORD /d 1 /f )'
+            $r = SysCmd $c 90
+            Log ("TightVNC reg add come SYSTEM -> " + (("" + $r.Out) -replace '\s+', ' '))
+        }
+        function VncSvcRestart {
+            try {
+                $s = Get-Service -Name 'tvnserver' -EA SilentlyContinue
+                if (-not $s) { return }
+                if ($s.Status -eq 'Running') { Stop-Service -Name 'tvnserver' -Force -EA SilentlyContinue; Start-Sleep -Seconds 2 }
+                Start-Service -Name 'tvnserver' -EA SilentlyContinue
+                Start-Sleep -Seconds 2
+                $s2 = Get-Service -Name 'tvnserver' -EA SilentlyContinue
+                # 'sc' da solo in PowerShell e' alias di Set-Content: serve sc.exe
+                if ($s2 -and $s2.Status -ne 'Running') { & sc.exe start tvnserver 2>&1 | Out-Null }
+            }
+            catch { Log ("TightVNC riavvio servizio: " + $_.Exception.Message) }
+        }
+        # via ufficiale per far rileggere la configurazione al servizio senza interrompere le sessioni
+        # in corso: "Updates settings of running TightVNC Server from the Windows registry"
+        function VncSvcReload {
+            $exe = Join-Path $env:ProgramFiles 'TightVNC\tvnserver.exe'
+            if (-not (Test-Path -LiteralPath $exe)) { return $false }
+            $r = Invoke-Proc $exe @('-controlservice', '-reload') 30
+            Log ("TightVNC -controlservice -reload -> code=" + $r.Code)
+            return ($r.Code -eq 0)
+        }
+        # il servizio tiene la configurazione in memoria: senza reload (o riavvio) la password non vale
+        function VncApplyPw {
+            VncPwWrite
+            if (-not (VncSvcReload)) { VncSvcRestart }
+            return (VncPwRead)
+        }
+        # eccezione firewall: se TightVNC era stato installato senza, il server non e' raggiungibile
+        function VncFirewall {
+            try {
+                $exe = Join-Path $env:ProgramFiles 'TightVNC\tvnserver.exe'
+                if (-not (Test-Path -LiteralPath $exe)) { return }
+                $ex = @(Get-NetFirewallRule -DisplayName '*TightVNC*' -EA SilentlyContinue | Where-Object { ([string]$_.Enabled) -eq 'True' })
+                if ($ex.Count -gt 0) { return }
+                New-NetFirewallRule -DisplayName 'iotatec TightVNC' -Direction Inbound -Action Allow -Program $exe -Profile Any -Enabled True -EA Stop | Out-Null
+                Log 'TightVNC: aggiunta eccezione firewall (mancava).'
+            }
+            catch { Log ("TightVNC firewall: " + $_.Exception.Message) }
+        }
+        # prodotto installato (ProductCode + versione), cercato in ENTRAMBE le viste di registro
+        # Le due viste si aprono con OpenBaseKey e la vista ESPLICITA, non con i provider HKLM:\...:
+        # da un processo a 32 bit (WOW64) il provider non vedrebbe mai la voce a 64 bit, $inst
+        # resterebbe $null e salterebbe la disinstallazione, mandando il /i a sbattere su SELFFOUND.
+        function VncInstalled {
+            $best = $null
+            foreach ($view in @([Microsoft.Win32.RegistryView]::Registry64, [Microsoft.Win32.RegistryView]::Registry32)) {
+                try {
+                    $base = [Microsoft.Win32.RegistryKey]::OpenBaseKey([Microsoft.Win32.RegistryHive]::LocalMachine, $view)
+                    $un = $base.OpenSubKey('SOFTWARE\Microsoft\Windows\CurrentVersion\Uninstall', $false)
+                    if ($un) {
+                        foreach ($name in $un.GetSubKeyNames()) {
+                            try {
+                                $sk = $un.OpenSubKey($name, $false)
+                                if (-not $sk) { continue }
+                                $dn = [string]$sk.GetValue('DisplayName', '')
+                                if ($dn -match '^TightVNC') {
+                                    $o = @{
+                                        Code    = $(if ($name -match '^\{[0-9A-Fa-f-]+\}$') { $name } else { '' })
+                                        Version = [string]$sk.GetValue('DisplayVersion', '')
+                                        Name    = $dn
+                                    }
+                                    if (-not $best) { $best = $o }
+                                    else { try { if ([version]$o.Version -gt [version]$best.Version) { $best = $o } } catch {} }
+                                }
+                                $sk.Close()
+                            }
+                            catch {}
+                        }
+                        $un.Close()
+                    }
+                    $base.Close()
+                }
+                catch {}
+            }
+            return $best
+        }
+        # righe utili dal log verboso di msiexec, per capire DOVE si e' rotto. Il log viene poi
+        # cancellato: contiene la riga di comando, quindi la password in chiaro.
+        function VncMsiLogTail {
+            $t = ''
+            try {
+                if (Test-Path -LiteralPath $msiLog) {
+                    $l = Get-Content -LiteralPath $msiLog -EA SilentlyContinue |
+                        Where-Object { $_ -match 'Return value 3|AlreadyUpdated|NoDowngrade|SetPasswordsActionSilently|FindRelatedProducts|Installation success or error status|Error [0-9]{4}|MainEngineThread is returning' } |
+                        Select-Object -Last 15
+                    $t = (($l -join ' / ') -replace '\s+', ' ')
+                    if ($pw) { $t = $t.Replace($pw, '***') }
                 }
             }
-            catch { Log ("TightVNC confronto password: " + $_.Exception.Message) }
+            catch {}
+            Remove-Item -LiteralPath $msiLog -Force -EA SilentlyContinue
+            if ($t.Length -gt 900) { $t = $t.Substring(0, 900) }
+            return $t
         }
 
-        # procura l'MSI (offline o download): serve sia a installare sia a riconfigurare
+        $svc0 = Get-Service -Name 'tvnserver' -EA SilentlyContinue
+        $inst = VncInstalled
+        Log ("TightVNC stato iniziale: servizio=" + $(if ($svc0) { $svc0.Status } else { 'assente' }) +
+            "  prodotto=" + $(if ($inst) { $inst.Name + ' v' + $inst.Version + ' ' + $inst.Code } else { 'assente' }))
+
+        # ---- 1) c'e' gia' ed e' gia' a posto: non toccare nulla (non far cadere sessioni in corso) ----
+        if ($svc0) {
+            $have = VncPwRead
+            Log ("TightVNC password memorizzata=[" + $have + "]  attesa=[" + $wantHex + "]")
+            if ($have -and $have -eq $wantHex) {
+                VncFirewall
+                if ($svc0.Status -ne 'Running') { VncSvcRestart }
+                St 'TightVNC: gia'' configurato correttamente'
+                Log 'TightVNC OK (nessuna modifica necessaria).'
+                return
+            }
+
+            # ---- 2) c'e' gia' ma la password e' diversa: la scrivo come SYSTEM, senza reinstallare ----
+            St 'TightVNC: imposto la password...'
+            $have = VncApplyPw
+            if ($have -eq $wantHex) {
+                VncFirewall
+                Log ("TightVNC OK (password scritta nel registro come SYSTEM; conservata la versione presente " + $(if ($inst) { 'v' + $inst.Version } else { '?' }) + ").")
+                return
+            }
+            Log ("TightVNC: scrittura diretta non riuscita (memorizzata=[" + $have + "]), passo a disinstalla+reinstalla.")
+        }
+
+        # ---- 3) procura l'MSI. In ogni caso finisce in $dir: l'MSI incorporato viene estratto in
+        #         %TEMP% dell'utente che ha elevato, e msiexec lo apre con l'identita' del servizio
+        #         Windows Installer (SYSTEM). Copiarlo in C:\iotatec elimina ogni dubbio di accesso.
+        $msi = Join-Path $dir 'tightvnc-setup-64bit.msi'
         if ($sync.offline) {
-            $msi = Join-Path $cfg.offlineDir 'tightvnc.msi'
-            if (-not (Test-Path -LiteralPath $msi)) { throw "TightVNC: file offline mancante." }
+            $emb = Join-Path $cfg.offlineDir 'tightvnc.msi'
+            if (-not (Test-Path -LiteralPath $emb)) { throw ("TightVNC: file offline mancante (" + $emb + ").") }
+            Copy-Item -LiteralPath $emb -Destination $msi -Force
         }
         else {
-            $msi = Join-Path $dir 'tightvnc-setup-64bit.msi'
-            $url = $cfg.vncMsiUrl
+            $urls = New-Object System.Collections.Generic.List[string]
             try {
                 $page = Invoke-WebRequest -Uri 'https://www.tightvnc.com/download.php' -UseBasicParsing -TimeoutSec 20 -Headers @{ 'User-Agent' = 'iotahelp' }
                 $m = [regex]::Match($page.Content, 'https://www\.tightvnc\.com/download/[0-9.]+/tightvnc-[0-9.]+-gpl-setup-64bit\.msi')
-                if ($m.Success) { $url = $m.Value }
-            } catch {}
+                if ($m.Success) { $urls.Add($m.Value) }
+            }
+            catch { Log ("TightVNC: pagina download non leggibile (" + $_.Exception.Message + ")") }
+            if (-not $urls.Contains([string]$cfg.vncMsiUrl)) { $urls.Add([string]$cfg.vncMsiUrl) }   # fallback della build
             St 'TightVNC: scarico ultima versione...'
-            Get-File $url $msi
-            if (-not (Test-Path -LiteralPath $msi)) { throw "TightVNC: download fallito." }
+            $got = $false; $lastErr = ''
+            foreach ($u in $urls) {
+                try {
+                    Get-File $u $msi
+                    # un MSI vero sta sopra il mezzo mega: sotto e' una pagina di errore salvata come .msi
+                    if ((Test-Path -LiteralPath $msi) -and (Get-Item $msi).Length -gt 500000) { $got = $true; Log ("TightVNC: scaricato " + $u); break }
+                }
+                catch { $lastErr = $_.Exception.Message; Log ("TightVNC: download fallito da " + $u + " (" + $lastErr + ")") }
+            }
+            if (-not $got) { throw ("TightVNC: download fallito. " + $lastErr) }
         }
 
-        # La password si imposta SOLO tramite l'MSI: la chiave HKLM\SOFTWARE\TightVNC\Server e' protetta
-        # (scrittura negata anche all'admin) e la scrive solo l'installer come SYSTEM. I parametri password
-        # valgono solo a NUOVA installazione, quindi se TightVNC c'e' gia' lo disinstallo prima.
-        if ($null -ne (Get-Service -Name 'tvnserver' -EA SilentlyContinue)) {
+        # ---- 4) disinstalla per ProductCode. NON per percorso dell'MSI: con una versione diversa
+        #         msiexec /x <file> risponde 1605 e non rimuove niente (era il bug precedente).
+        if ($inst -and $inst.Code) {
             St 'TightVNC: rimuovo la versione presente...'
-            Invoke-Proc 'msiexec.exe' @('/x', $msi, '/quiet', '/norestart') 120 | Out-Null
+            $ru = Invoke-Proc 'msiexec.exe' @('/x', $inst.Code, '/quiet', '/norestart') 180
+            Log ("TightVNC msiexec /x " + $inst.Code + " -> code=" + $ru.Code)
             Start-Sleep -Seconds 4
         }
 
+        # ---- 5) installa: le proprieta' della password valgono solo adesso, a installazione nuova ----
         St 'TightVNC: installazione (servizio + password)...'
         $msiArgs = @(
-            '/i', $msi, '/quiet', '/norestart',
+            '/i', $msi, '/quiet', '/norestart', '/l*v', $msiLog,
             'ADDLOCAL=Server',
             'SERVER_REGISTER_AS_SERVICE=1', 'SERVER_ADD_FIREWALL_EXCEPTION=1', 'SERVER_ALLOW_SAS=1',
             'SET_USEVNCAUTHENTICATION=1', 'VALUE_OF_USEVNCAUTHENTICATION=1',
             'SET_PASSWORD=1', ('VALUE_OF_PASSWORD=' + $pw),
-            'SET_ACCEPTRFBCONNECTIONS=1', 'VALUE_OF_ACCEPTRFBCONNECTIONS=1'
+            'SET_ACCEPTRFBCONNECTIONS=1', 'VALUE_OF_ACCEPTRFBCONNECTIONS=1',
+            # senza queste due LoopbackOnly non viene scritto affatto e si eredita il default
+            # dell'eseguibile: meglio dire esplicitamente che deve accettare connessioni non locali
+            'SET_LOOPBACKONLY=1', 'VALUE_OF_LOOPBACKONLY=0'
         )
-        $r = Invoke-Proc 'msiexec.exe' $msiArgs 180
-        Log ("TightVNC msiexec /i code=" + $r.Code)
+        $r = Invoke-Proc 'msiexec.exe' $msiArgs 300
+        Log ("TightVNC msiexec /i -> code=" + $r.Code)
+        # 1618 = un'altra installazione MSI in corso (tipicamente Windows Update): aspetto e riprovo
+        for ($i = 1; $i -le 6 -and $r.Code -eq 1618; $i++) {
+            St 'TightVNC: attendo Windows Installer (occupato)...'
+            Start-Sleep -Seconds 20
+            $r = Invoke-Proc 'msiexec.exe' $msiArgs 300
+            Log ("TightVNC msiexec /i (tentativo " + ($i + 1) + ") -> code=" + $r.Code)
+        }
         Start-Sleep -Seconds 5
+
+        # ---- 6) il servizio deve esserci ----
         $svc = Get-Service -Name 'tvnserver' -EA SilentlyContinue
-        if ($null -eq $svc) { throw ("TightVNC: installazione fallita (codice " + $r.Code + ").") }
-        if ($svc.Status -ne 'Running') { try { $svc.Start() } catch {} }
-        if (-not $sync.offline) { Remove-Item -LiteralPath $msi -Force -EA SilentlyContinue }
-        Log "TightVNC OK (password impostata dall'MSI)."
+        if ($null -eq $svc) { throw ("TightVNC: installazione fallita (msiexec " + $r.Code + "). " + (VncMsiLogTail)) }
+        if ($svc.Status -ne 'Running') { VncSvcRestart }
+        VncFirewall
+
+        # ---- 7) verifica la password. Se l'MSI ha fatto un upgrade invece di un'installazione nuova,
+        #         la custom action e' stata saltata: la scrivo io.
+        $have = VncPwRead
+        Log ("TightVNC dopo msiexec: password memorizzata=[" + $have + "]  attesa=[" + $wantHex + "]")
+        if ($have -ne $wantHex) {
+            St 'TightVNC: imposto la password...'
+            $have = VncApplyPw
+            Log ("TightVNC dopo scrittura diretta: memorizzata=[" + $have + "]")
+        }
+        if ($have -ne $wantHex) {
+            $tail = VncMsiLogTail
+            if (-not $have) {
+                # registro illeggibile: se e' stata un'installazione NUOVA e msiexec ha dato esito
+                # positivo, la password l'ha messa l'MSI. Lo segnalo ma non blocco.
+                if (($okCodes -contains $r.Code) -and (-not $inst)) {
+                    Log 'ATTENZIONE TightVNC: password non verificabile (chiave di registro illeggibile anche come SYSTEM), ma installazione nuova riuscita: impostata dall''MSI.'
+                    Remove-Item -LiteralPath $msi -Force -EA SilentlyContinue
+                    return
+                }
+                throw ("TightVNC: installato, ma non riesco a VERIFICARE la password (chiave di registro illeggibile anche come SYSTEM). msiexec " + $r.Code + ". " + $tail)
+            }
+            throw ("TightVNC: installato, ma la password memorizzata non e' quella attesa. msiexec " + $r.Code + ". " + $tail)
+        }
+
+        Remove-Item -LiteralPath $msiLog -Force -EA SilentlyContinue    # contiene la password in chiaro
+        Remove-Item -LiteralPath $msi -Force -EA SilentlyContinue       # era una copia nella cartella di lavoro
+        Log 'TightVNC OK (password verificata).'
     }
 
     try {
@@ -735,6 +979,12 @@ if ($OfflineBuild) {
     $cbOffline = New-Object System.Windows.Forms.CheckBox
     $cbOffline.Text = 'Installa offline (usa i file inclusi, senza rete)'
     $cbOffline.Checked = $false
+    # i file incorporati vengono estratti in %TEMP% all'avvio: se non ci sono (estrazione fallita,
+    # cartella temporanea ripulita) non offrire un'opzione che fallirebbe a meta' installazione
+    if (-not $OfflineAvailable) {
+        $cbOffline.Enabled = $false
+        $cbOffline.Text = 'Installa offline (file inclusi non disponibili)'
+    }
     $cbOffline.Font = New-Object System.Drawing.Font('Segoe UI', 10)
     $cbOffline.ForeColor = $cDark; $cbOffline.AutoSize = $false
     $cbOffline.Size = New-Object System.Drawing.Size(408, 26)
@@ -880,7 +1130,7 @@ $btnInstall.Add_Click({
         return
     }
     $sync.doRust = $script:sel['rust']; $sync.doSup = $script:sel['sup']; $sync.doVnc = $script:sel['vnc']
-    if ($cbOffline) { $sync.offline = [bool]$cbOffline.Checked }
+    if ($cbOffline) { $sync.offline = ([bool]$cbOffline.Checked -and [bool]$OfflineAvailable) }
     $sync.state['rust'] = $(if ($script:sel['rust']) { 'pending' } else { 'skip' })
     $sync.state['sup']  = $(if ($script:sel['sup'])  { 'pending' } else { 'skip' })
     $sync.state['vnc']  = $(if ($script:sel['vnc'])  { 'pending' } else { 'skip' })

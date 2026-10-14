@@ -43,6 +43,13 @@ if (-not (Test-Path $secFile)) {
 $sec = & $secFile
 foreach ($k in @('RD_PASSWORD', 'RD_KEY', 'VNC_PASSWORD')) {
     if ([string]::IsNullOrEmpty([string]$sec[$k])) { throw "Nel file dei segreti manca la voce '$k'." }
+    # una virgoletta doppia romperebbe la riga di comando costruita a runtime
+    if (([string]$sec[$k]).Contains('"')) { throw "'$k' contiene una virgoletta doppia: non e' utilizzabile." }
+}
+# lo standard VNC cifra con DES a 8 byte: oltre l'ottavo carattere la password viene TRONCATA, quindi
+# un segreto piu' lungo installerebbe in silenzio una password diversa da quella scritta nel file
+if (([string]$sec['VNC_PASSWORD']).Length -gt 8) {
+    throw ("VNC_PASSWORD e' di " + ([string]$sec['VNC_PASSWORD']).Length + " caratteri: lo standard VNC usa solo i primi 8, quindi la password installata NON sarebbe quella del file. Accorciala a 8.")
 }
 
 $out = $src.Replace('@@LOGO_B64@@', $b64)
@@ -135,7 +142,7 @@ elseif ($Offline) {
 
     # --- TightVNC: identificativo = URL dell'MSI (contiene la versione) ---
     $need = -not (Test-Path $vn); $id = $null
-    $vncUrl = 'https://www.tightvnc.com/download/2.8.88/tightvnc-2.8.88-gpl-setup-64bit.msi'
+    $vncUrl = 'https://www.tightvnc.com/download/2.8.90/tightvnc-2.8.90-gpl-setup-64bit.msi'
     if ($Latest -or $need) {
         try {
             $page = Invoke-WebRequest 'https://www.tightvnc.com/download.php' -UseBasicParsing -TimeoutSec 20 -Headers $H
