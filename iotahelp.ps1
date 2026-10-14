@@ -39,7 +39,7 @@ $Def_Rust = $true
 $Def_Sup  = $true
 $Def_Vnc  = $false
 
-$AppVersion       = '1.6.0'                         # <<< versione mostrata nella GUI e nell'exe.
+$AppVersion       = '1.6.1'                         # <<< versione mostrata nella GUI e nell'exe.
 #                                                   #     SI INCREMENTA L'ULTIMA CIFRA: 1.6.0 -> 1.6.1 -> 1.6.2 ...
 #                                                   #     Niente salti alla cifra di mezzo.
 $PreviewMode      = $false                          # $true = build ANTEPRIMA (simula, non installa, senza admin)
@@ -105,6 +105,20 @@ $worker = {
     function Log($m) { try { Add-Content -LiteralPath $LogFile -Value ("[{0}] {1}" -f (Get-Date -Format 'HH:mm:ss'), $m) -ErrorAction SilentlyContinue } catch {} }
     function St($msg) { $sync.status = $msg; Log $msg }
 
+    # Termina un processo E TUTTI I SUOI DISCENDENTI (prima i figli, poi il padre).
+    # Serve perche' qui si lancia sempre tramite cmd.exe: uccidere solo cmd lascerebbe orfano il
+    # programma vero, e se quello ha aperto una finestra modale (msiexec lo fa, e lo fa anche con
+    # /quiet quando la riga di comando non gli piace) la finestra resterebbe sullo schermo
+    # dell'utente per sempre, con l'installazione apparentemente ferma.
+    function Stop-ProcTree([int]$procId) {
+        try {
+            foreach ($c in (Get-CimInstance Win32_Process -Filter ("ParentProcessId=" + $procId) -EA SilentlyContinue)) {
+                Stop-ProcTree ([int]$c.ProcessId)
+            }
+        }
+        catch {}
+        try { Stop-Process -Id $procId -Force -EA SilentlyContinue } catch {}
+    }
     # esegue un processo (nascosto) catturando stdout/stderr; ritorna @{Code;Out}
     function Invoke-Proc([string]$file, [string[]]$argList, [int]$timeoutSec = 120) {
         # MAI usare pipe (RedirectStandardOutput/Error) con rustdesk: lancia processi FIGLI che
@@ -140,7 +154,11 @@ $worker = {
             $pi.UseShellExecute = $false
             $pi.CreateNoWindow = $true
             $proc = [System.Diagnostics.Process]::Start($pi)
-            if (-not $proc.WaitForExit($timeoutSec * 1000)) { try { $proc.Kill() } catch {}; return @{ Code = -1; Out = 'timeout' } }
+            if (-not $proc.WaitForExit($timeoutSec * 1000)) {
+                Log ("timeout " + $timeoutSec + "s: termino " + (Split-Path $file -Leaf) + " e i suoi figli")
+                Stop-ProcTree $proc.Id
+                return @{ Code = -1; Out = 'timeout' }
+            }
             $code = -1; try { $code = [int]$proc.ExitCode } catch {}
             $o = ''
             try { if (Test-Path -LiteralPath $outF) { $o = (Get-Content -LiteralPath $outF -Raw -EA SilentlyContinue) } } catch {}
